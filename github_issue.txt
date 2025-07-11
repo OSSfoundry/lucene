@@ -1,0 +1,225 @@
+Relax Lucene Index Upgrade Policy to Allow Safe Upgrades Across Multiple Major Versions apache/lucene#13797
+Open • markrmiller opened about 9 months ago • 7 comments
+Labels: type:enhancement
+
+
+  ### Description
+
+  TLDR: Relax index upgrade policy across major versions to only be as strict as necessary.
+
+  Here is an attempted summary of a recent discussion about this.
+
+  Currently, Lucene's policy requires a full reindex when upgrading across more than one major version, which can
+  create significant friction for users with large indexes. We propose relaxing this policy to allow upgrades across
+  multiple major versions when it is safe to do so. The goal is to provide flexibility for users without compromising
+  data integrity or flexibility.
+
+  Proposed Changes:
+
+  • Modify Upgrade Policy: Allow upgrades across multiple major versions, replacing the existing restriction with a
+  configurable MIN_SUPPORTED_MAJOR version in Version.java.
+  • Controlled Version Bumping: Bump MIN_SUPPORTED_MAJOR only when necessary, due to index format changes that prevent
+  safe upgrades (e.g., changes to norms encoding).
+  • Improved Documentation: Clearly document which versions can be safely upgraded to the current version without
+  reindexing.
+  • Retain Reindexing When Necessary: Ensure that reindexing is still required when necessary to maintain correctness
+  or prevent the propagation of corruption.
+
+  Benefits:
+
+  • Reduces friction and operational overhead for users with large indexes.
+  • Facilitates more frequent major releases by reducing mandatory reindexing.
+  • Maintains safety and integrity by reindexing only when required.
+
+  Implementation Plan:
+
+  • Modify Version.java to use a configurable MIN_SUPPORTED_MAJOR.
+  • Update the index upgrade logic to check against MIN_SUPPORTED_MAJOR rather than just the previous major version.
+  • Enhance documentation to provide clear guidelines on safe upgrade paths and scenarios requiring reindexing.
+
+  Request for Feedback: We welcome feedback from the community on this proposal, especially regarding its potential
+  impact, implementation details, and any concerns about safety and backward compatibility.
+
+  • Note: Upgrading from Lucene 20 to Lucene 23 would require first going from 20 to 21, from 21 to 22, and then 22 to
+  23. Unless of course a change occurred in one of those versions that would prevent you from doing so, in which case
+  a reindex would be required.
+
+
+jpountz (Member) • Sep 18, 2024
+
+  I have had many discussions on this topic of file format bw compat over the years, because users would ideally like
+  to think of their indexes as never expiring. If this is the problem that should be solved, then there are two main
+  options that I can think of:
+
+  • increasing backward compatibility of already written data,
+  • performing a periodic transparent background reindexing.
+
+  I have developed a preference for the second option. It is cheap in hardware costs when you compare the storage cost
+  of storing an index for ~3 years (which is about the duration of our backward compatibility window) with the cost of
+  reindexing the same index. And it comes with the great benefit that it can also be taken as an opportunity to index
+  data in a more modern way, (e.g. switching from trie fields to points in Lucene 6, switching scoring factors from
+  doc values to FeatureField in Lucene 8, enabling vector search in addition to lexical search in Lucene 9, enabling
+  sparse indexing in Lucene 10, etc.).
+
+  The way I'm thinking of it is that you would create a point-in-time view of your index, reindex it into a new index,
+  stop the world while you're replaying operations since the point-in-time view was taken and points are swapped from
+  the old index to the new index, and finally remove the old index. Given the required orchestration that is needed,
+  it's probably best solved on top of Lucene (in Solr, Elasticsearch, or luceneserver), but we could look into adding
+  tooling for this in Lucene?
+
+  That said, I think there's benefits to your suggestion of decoupling major versions from backward compatibility, I
+  would just use it to make it easier for us to do more frequent major versions without shortening our backward
+  compatibility window, rather than to increase our backward compatibility window?
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2358365311
+
+markrmiller (Member) • Oct 12, 2024
+
+  Thank you, Adrien, for your thoughtful response and for sharing your expertise on this topic. Your insights are
+  valuable, and I'd like to address a few points and seek some clarification.
+
+  First, I want to emphasize that the two approaches we're discussing - relaxing the upgrade policy and implementing
+  background reindexing - are not mutually exclusive. Both have merit and could potentially be implemented to serve
+  different use cases and user needs.
+
+  Relaxed Upgrade Policy: This approach aims to reduce friction for upgrades by allowing them across multiple major
+  versions when safe to do so.
+
+  Background Reindexing: This method, as you've outlined, provides a path for long-term index modernization and
+  feature
+  adoption.
+
+  I'd like to clarify that our original proposal isn't about extending the backward compatibility window. Rather, it's
+  about allowing index upgrades as long as backward compatibility hasn't been broken - essentially making the upgrade
+  check only as strict as necessary. This doesn't change any promises about the backward compatibility window itself.
+  Could you elaborate on your concerns about extending the backward compatibility window? While that's not our
+  intention, understanding these concerns could be useful.
+
+  Given that these approaches serve different purposes and timeframes, I believe there's value in considering both:
+
+  The relaxed upgrade policy could provide immediate benefits with relatively low development and operational costs.
+  The background reindexing solution offers long-term benefits for feature adoption and index modernization, albeit
+  with higher development and operational costs.
+
+  Implementing both could provide flexibility for users with different needs and resources. Users could benefit from
+  easier upgrades in the short term while having a path to adopt new features when they're ready.
+
+  Questions
+
+  Could you share more about your concerns regarding the relaxed upgrade policy? Are there specific technical or
+  operational issues you foresee?
+  Do you see any conflicts or problems with implementing both approaches?
+  Would you be open to a phased approach, where we implement the relaxed upgrade policy first and then work on tooling
+  for background reindexing?
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2408708392
+
+vigyasharma (Member) • May  5, 2025
+
+  This is an interesting proposal, and I like the idea of making version upgrades more streamlined. However, I'm a bit
+  confused with how the proposed mechanism should play out. Could you help me understand with an example?
+
+  Suppose we were to implement this today, we would set  MIN_SUPPORTED_MAJOR = 10  to correspond with Lucene 11. If
+  there are no breaking changes in Lucene 12, 13, and 14 we would not change this value. When we make an index format
+  change, say in Lucene 15.0.0, I assume by your proposal, we would set  MIN_SUPPORTED_MAJOR  to  14 , and only ensure
+  backward compatibility logic b/w v14 and v15?
+
+  Now when Lucene 16.0.0 rolls out, what happens to  MIN_SUPPORTED_MAJOR  version value? If it is kept at 14, then v16
+  will need to carry forward the backward compatibility logic. Today, by design, we only need to do it for the last
+  release. Is the idea that we'll upgrade  MIN_SUPPORTED_MAJOR  to 15, even if there is nothing breaking b/w 15 and
+  16? Remembering this logic feels trappy? Or maybe I'm just confused with how this will work. Hopefully you have a
+  better example :)
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2850118949
+
+markrmiller (Member) • May  9, 2025 • Edited
+
+  Thank you for your question, Vigya.
+
+  │ Will v16 still need to ship the 14-format code?
+
+  Yes—until a new on-disk break forces  MIN_SUPPORTED_MAJOR  to move again.
+
+  │ Do we ever bump even when nothing broke?
+
+  No. We bump only on an incompatible format change; otherwise, the constant stays put. With the caveat that nothing
+  is promised to the user beyond one major version, and something could come up that a developer decides warrants
+  bumping anyway.
+
+  Let me try to clarify with a concrete example.
+
+  The idea is that MIN_SUPPORTED_MAJOR represents "the oldest major version that the current version can read
+  directly" - not a version-by-version compatibility chain.
+
+  Here's how it would work:
+
+  Let's say we implement this in Lucene 11 and set MIN_SUPPORTED_MAJOR = 10, meaning Lucene 11 can read Lucene 10
+  indexes directly.
+
+  • If Lucene 12 has no breaking index format changes, we'd keep MIN_SUPPORTED_MAJOR = 10
+  • If Lucene 13 also has no breaking changes, it stays at 10
+  • If Lucene 14 has no breaking changes, still 10
+
+  Now, if Lucene 15 introduces a breaking index format change (e.g., new norms encoding), we'd set MIN_SUPPORTED_MAJOR
+  = 14. This means Lucene 15 can read indexes from version 14 and no older.
+
+  When Lucene 16 comes along:
+
+  • If there are no breaking changes, MIN_SUPPORTED_MAJOR remains 14
+  • If there are breaking changes, we'd bump to MIN_SUPPORTED_MAJOR = 15
+
+  So you would need to retain codec read code for versions ≥ MIN_SUPPORTED_MAJOR,  but the assumption is this would
+  typically be a low cost for the user benefit. Where it’s not, there is no promise, and MIN_SUPPORTED_MAJOR could be
+  raised even where no break has forced it as a kind of exceptional case. Again, no promises have been made to users.
+
+  Does that help clarify the proposal? I think your concerns are valid. We would definitely need to ensure this
+  mechanism is well-documented and clearly understood. <subjective_statement> Still, it doesn’t seem like a
+  significant
+  lift given what is already required to make changes and ensure one major release back compat.
+  </subjective_statement>
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2865097554
+
+vigyasharma (Member) • May 11, 2025
+
+  Thanks for the example Mark, that was helpful. I think the proposal makes sense. It makes upgrades across versions
+  easier without adding significant backward compatibility overhead.
+
+  I'm not sure I fully grok Adrien's concerns. It seems to me that this change doesn't really increase backward
+  compatibility of already written data. We can bump up the  MIN_SUPPORTED_MAJOR_VERSION  whenever breaking changes
+  are made, effectively only keeping compatibility with the last format change. Users will still need to reindex when
+  they jump multiple incompatible versions. We just don't force a reindex when it's not needed. Am I missing
+  something?
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2869271879
+
+rmuir (Member) • May 11, 2025
+
+  I think there may be confusion around:
+
+  1. minimum created version <-- reflects lucene version that first created the index
+  2. minimum version of any segment <-- reflects what actual backwards compat code we need to support.
+
+  The first one here, we can be lazy about and only bump when certain rarer changes are made (such as lossy parts
+  around norms, maybe corruption bugs). Today we "bump it" implicitly even if there isn't a good reason. I think the
+  changes that require this are rare, but we do need to retain the facility to make such changes.
+
+  If we are lazy about the minimum created version, and only bump it when we need to, users can merge segments, rather
+  than reindex, to get to the latest version in most cases. And it doesn't require additional costs such as dragging
+  extra backwards codecs around.
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2869305562
+
+markrmiller (Member) • May 11, 2025 • Newest comment
+
+  Yeah, that would be preferable to a bunch of versioned code that essentially all reads the same format. I suppose I
+  was thinking of using the config for "what is the minimum version I can read" over "what version was this written
+  with" because my immediate thought was you are lying about the version with the latter - but you would of course
+  just
+  consider it the index format version it was written with rather than the actual Lucene version.
+
+View the full review: https://github.com/apache/lucene/issues/13797#issuecomment-2869364967
+
+
+View this issue on GitHub: https://github.com/apache/lucene/issues/13797
+
