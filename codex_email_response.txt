@@ -1,0 +1,108 @@
+Subject: Finalizing Proposal: Relaxed Index Upgrade Policy
+
+Hi all,
+
+Thanks to everyone who contributed to the discussion. Based on Robert's
+clarification about distinguishing the version an index was created with from the
+versions of its segments, we have a clear path forward. Below is the final plan I
+intend to implement. Unless anyone spots a problem, I'll start working on the
+code and documentation shortly.
+
+---------------------------------------------------------------------
+Final Proposal: "Lazy MIN_SUPPORTED_MAJOR"
+---------------------------------------------------------------------
+
+1. **Guiding principle**
+   - Lucene should only force a reindex when an on-disk incompatibility makes it
+     impossible or unsafe to read an older index.
+   - When no such change has occurred, users should be able to upgrade across
+     multiple major versions by opening the index directly with the new release.
+     Older segments remain searchable thanks to backward codecs, and they can be
+     merged to the latest format at any time.
+
+2. **Two version concepts**
+   - **Minimum created major (MIN_SUPPORTED_MAJOR)** – the oldest major version
+     of an index that this Lucene release promises it can open at all. We bump
+     this value only for true incompatibilities (e.g. lossy format changes or
+     corruption fixes).
+   - **Minimum segment major** – determined by the set of codec readers we ship.
+     Lucene continues to read segments from earlier versions via the
+     `backward-codecs` module. These segments are readable immediately but can be
+     merged to the latest format for best performance.
+
+   These two values are independent. An index created with Lucene 10 can be
+   opened directly by Lucene 14 if `MIN_SUPPORTED_MAJOR` remains 10. Older
+   segments remain readable and may be forceMerged to the new format whenever
+   convenient.
+
+3. **Initial settings**
+   - In Lucene 11 we set `MIN_SUPPORTED_MAJOR = 10`.
+   - The constant will remain unchanged in subsequent majors until an actual
+     incompatible change requires a bump. When such a change occurs—for example
+     in 15.0—`MIN_SUPPORTED_MAJOR` would be updated to 14.
+
+4. **Compatibility promise**
+   - We still guarantee direct segment compatibility with the immediately
+     previous major. The new constant merely makes that promise explicit instead
+     of auto‑advancing every release. We reserve the right to increase it even
+     without a hard break if the maintenance burden becomes too high, but that
+     should be rare.
+
+---------------------------------------------------------------------
+Required Code Changes
+---------------------------------------------------------------------
+
+A. **Version.java**
+   - Replace the computed constant
+     ```java
+     public static final int MIN_SUPPORTED_MAJOR = Version.LATEST.major - 1;
+     ```
+     with a manually maintained value and detailed Javadoc documenting when it
+     should be bumped. Initial value: `10`.
+
+B. **IndexWriter.addIndexes(Directory...)**
+   - After further review we should **not** relax the existing check that all
+     inputs share the same `indexCreatedVersionMajor`.
+   - Mixing indexes created by different majors could hide subtle
+     incompatibilities, so `addIndexes` will continue to insist on an exact
+     match even though older indexes can be opened and merged separately.
+
+C. **IndexWriterConfig**
+   - Update `setIndexCreatedVersionMajor` so that the lower bound check uses
+     `MIN_SUPPORTED_MAJOR` rather than `LATEST.major - 1`.
+
+D. **Tests**
+   - Update `BackwardsCompatibilityTestBase` and related tests to assert against
+     `MIN_SUPPORTED_MAJOR`.
+   - Add tests ensuring that indexes created at `MIN_SUPPORTED_MAJOR` can be
+     opened and merged sequentially when upgrading across majors.
+
+E. **Error messages**
+   - Improve `IndexFormatTooOldException` text so users understand when they need
+     to reindex versus when merging suffices. Include the current
+     `MIN_SUPPORTED_MAJOR` in the message.
+
+F. **Release tooling**
+   - Add a checklist step in `dev-docs/release.md` reminding the release manager
+     to review whether `MIN_SUPPORTED_MAJOR` needs a bump.
+
+---------------------------------------------------------------------
+Required Documentation Changes
+---------------------------------------------------------------------
+
+1. Document the new policy in `CHANGES.txt` under the 11.0 section.
+2. Update `MIGRATE.md` with an example showing how to upgrade, e.g. from 10 → 14
+   by opening the index with 14 and forceMerging old segments as needed.
+3. Expand the Javadoc for `Version.MIN_SUPPORTED_MAJOR` describing the rationale
+   and bump procedure.
+
+---------------------------------------------------------------------
+Next Steps
+---------------------------------------------------------------------
+
+If there are no objections, I will open a PR implementing these changes—code,
+tests, and documentation—next week.
+
+Thanks again for the productive discussion!
+
+— Mark
