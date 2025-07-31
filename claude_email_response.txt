@@ -1,0 +1,141 @@
+Subject: Finalizing Proposal: Relaxed Index Upgrade Policy
+
+Hi all,
+
+Thanks again for the discussion so far.  I think we have now converged on a clear and practical path forward that reflects Robert's clarifications and everyone's feedback.  Robert's key insight about distinguishing between "minimum created version" and "minimum segment version" is exactly what we needed to move forward with a clean, efficient solution.
+
+Below is a complete proposal and the concrete changes I plan to commit.  Unless anyone feels something is still missing, I will start on the implementation and close this issue once the work is merged.
+
+---------------------------------------------------------------------
+Final Proposal:  "Lazy MIN_SUPPORTED_MAJOR"
+---------------------------------------------------------------------
+
+1. Guiding principle
+   • Lucene should only force a full re-index when it is **technically required** to keep indexes correct.
+   • When an upgrade is safe, users should be able to upgrade across multiple major versions without a full re-index. Currently, you can only upgrade ONE major version via merging before being forced to reindex, because `indexCreatedVersionMajor` is immutable and version checks use this value.
+
+2. Two distinct version concepts (following Robert's note)
+   • minimum **created** major (MIN_SUPPORTED_MAJOR) – The oldest major version we promise to *open* at all.  Bumped **only** when an on-disk incompatibility, data-loss fix, or similar rare event actually prevents safe reading.
+   • minimum **segment** major – Dictated by the codec readers we bundle. This remains unchanged: a Lucene release only guarantees it can read segments from the *previous* major version.
+
+   **Key insight**: An index created with Lucene 10 can be opened by Lucene 14 (if MIN_SUPPORTED_MAJOR ≤ 10), but any segments older than Lucene 13 will need to be merged/rewritten to be readable. Users accomplish this through forceMerge() operations, not full reindexing.
+
+   In other words, MIN_SUPPORTED_MAJOR answers "can the index be opened?", while codec support answers "can legacy segments be read directly?". The two concepts are independent.
+
+3. Initial settings
+   • When we release Lucene 11.0.0 we will set `MIN_SUPPORTED_MAJOR = 10`.
+   • Future releases leave this constant untouched **unless** they introduce an incompatible format change; at that point we bump to the last compatible major (e.g. a break in 15.0.0 → set to 14).
+
+4. No promise expansion
+   • We continue to guarantee backward compatibility for **one** major, exactly as today.  The constant merely makes that promise *explicit* instead of computed as `LATEST-1`, so it can remain pinned for several majors if nothing breaks.  We still reserve the right to raise it even without a break if the maintenance burden becomes too high.
+
+**What changes in behavior**:
+• Before: MIN_SUPPORTED_MAJOR = auto-computed as (LATEST-1), so each major version forces reindexing of indexes older than 1 major version
+• After: MIN_SUPPORTED_MAJOR = manually maintained, allowing indexes to remain readable across multiple major versions until we explicitly decide compatibility is broken
+• Key benefit: Eliminates the automatic forced reindexing that happens with each major release
+
+---------------------------------------------------------------------
+Required Code Changes
+---------------------------------------------------------------------
+
+A. `org.apache.lucene.util.Version`
+   • Replace the existing constant:
+     ```java
+     public static final int MIN_SUPPORTED_MAJOR = Version.LATEST.major - 1;
+     ```
+   • With a manually-maintained value:
+     ```java
+     /**
+      * Constant for the minimal supported major version of an index. This version is defined by the
+      * version that initially created the index.
+      * 
+      * <p>This constant is manually controlled and should only be bumped when format changes make
+      * it impossible to safely read older indexes. Examples include:
+      * <ul>
+      *   <li>Lossy encoding changes (e.g., norms format changes that cannot be recovered)</li>
+      *   <li>Index-level format changes that prevent reading (e.g., segments_N file format)</li>
+      *   <li>Critical corruption bugs that make older indexes potentially invalid</li>
+      * </ul>
+      * 
+      * <p>This constant should NOT be bumped automatically with major version releases. The goal
+      * is to allow users to upgrade across multiple major versions when safe to do so.
+      */
+     public static final int MIN_SUPPORTED_MAJOR = 10;
+     ```
+
+B. No additional changes needed in `SegmentInfos.java` / `StandardDirectoryReader.java`
+   • These files already use `Version.MIN_SUPPORTED_MAJOR` correctly for version checking
+   • The lazy constant behavior will automatically apply
+
+C. `IndexWriter.java` (addIndexes method) - Consider relaxing restrictions
+   • Current check: `if (segmentInfos.getIndexCreatedVersionMajor() != sis.getIndexCreatedVersionMajor())` (requires EXACT match)
+   • This is MORE restrictive than general Lucene policy (which allows one major version back)
+   • Potential change: `if (sis.getIndexCreatedVersionMajor() < Version.MIN_SUPPORTED_MAJOR)` 
+   • This would align addIndexes with index opening policy, but needs validation that codecs can actually handle the segments
+
+D. BW compatibility tests
+   • Update `BackwardsCompatibilityTestBase` to use the constant instead of `LATEST-1`.
+   • Add a unit test that fails if someone forgets to bump the constant when a real format change is introduced (asserts expected min).
+   • Add tests to verify that indexes created with MIN_SUPPORTED_MAJOR can be opened and searched
+   • Add tests to verify appropriate error messages for incompatible versions
+   • Verify that segment merging behavior remains unchanged (still limited by codec compatibility)
+
+E. Error message improvements
+   • Enhance IndexFormatTooOldException messages to clearly explain when reindexing is required:
+     - Clarify that index was created before MIN_SUPPORTED_MAJOR
+     - Explain that reindexing from source data is required
+     - Provide the specific MIN_SUPPORTED_MAJOR value in error messages
+
+F. Build / release tooling
+   • Add a checklist item in `dev-docs/release.md` reminding RM to review whether `MIN_SUPPORTED_MAJOR` needs a bump for the new major.
+   • Add validation in build process to ensure MIN_SUPPORTED_MAJOR hasn't been accidentally changed
+
+---------------------------------------------------------------------
+Required Documentation Changes
+---------------------------------------------------------------------
+
+1. `CHANGES.txt` (11.0 section) – describe the new policy and how to upgrade.
+2. `MIGRATE.md` – provide a worked example (10 → 14 via merges).
+3. Javadoc on `Version.MIN_SUPPORTED_MAJOR` – policy, rationale, bump procedure.
+
+Example upgrade scenario for documentation:
+
+**Core Problem**: Currently, `MIN_SUPPORTED_MAJOR` auto-advances with each release, forcing reindexing even when no technical incompatibility exists.
+
+**Current behavior**:
+• Lucene 11: MIN_SUPPORTED_MAJOR = 10 → Can open Lucene 10 index ✓
+• Lucene 12: MIN_SUPPORTED_MAJOR = 11 → Cannot open Lucene 10 index → Must reindex ✗
+• Lucene 13: MIN_SUPPORTED_MAJOR = 12 → Cannot open Lucene 10 index → Must reindex ✗
+
+**Proposed behavior** (lazy MIN_SUPPORTED_MAJOR = 10):
+• Lucene 11-14: MIN_SUPPORTED_MAJOR remains 10 → Can open Lucene 10 index ✓
+• Eliminates automatic forced reindexing with each major release
+• Only require reindexing when actual format incompatibilities are introduced
+
+**Key benefit**: Changes the trigger for forced reindexing from "automatic with each major release" to "only when technically necessary."
+
+**Note**: The exact mechanics of segment upgrading and codec compatibility require further technical review, but the core principle is to eliminate unnecessary forced reindexing.
+
+---------------------------------------------------------------------
+Next Steps
+---------------------------------------------------------------------
+
+• I will open a PR implementing the above (code + tests + docs).
+• Please shout if you spot anything we have overlooked or disagree with the wording/policy.
+• Barring new concerns I will merge in a week and close this issue.
+
+## Summary of Benefits
+
+This approach provides the exact benefits we were seeking:
+
+1. **Reduced operational overhead**: Users can upgrade across multiple major versions without reindexing when safe
+2. **Clear upgrade path**: Error messages clearly indicate when reindexing is required vs. when merging suffices
+3. **Maintains safety**: We retain the ability to force reindexing when technically necessary
+4. **No added complexity**: We're not adding new mechanisms, just being smarter about when to require reindexing
+5. **Addresses the core issue**: Large indexes can be upgraded without the massive operational cost of reindexing
+
+The key insight from Robert about distinguishing between "minimum created version" and "minimum segment version" makes this solution both elegant and practical. It allows us to provide user benefits while maintaining our ability to make necessary format changes when required.
+
+Thanks again to Robert, Adrien, Vigya and everyone who weighed in. This collaborative approach has led to a much better solution than the original proposal.
+
+— Mark
